@@ -25,8 +25,8 @@ w_ub = 10  # Upper bound of the eigenvalue of the dual metric
 w_lb = 0.1  # Lower bound of the eigenvalue of the dual metric
 
 # Configuration variables
-task = 'MUAV'  # Name of the model
-log = 'log_MUAV'  # Path to a directory for storing the training log
+task = 'MUAV_point_mass'  # Name of the model
+log = 'log_MUAV_point_mass_fieldformer'  # Path to a directory for storing the training log
 use_cuda = True  # Set to False to disable CUDA
 
 np.random.seed(1024)
@@ -198,10 +198,9 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     loss += loss_pos_matrix_random_sampling(-C1_LHS_1 - epsilon * torch.eye(C1_LHS_1.shape[-1]).unsqueeze(0).type(x.type()))
     loss += loss_pos_matrix_random_sampling(w_ub * torch.eye(W.shape[-1]).unsqueeze(0).type(x.type()) - W)
     loss += 1. * sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s])
-    
-    # Add a penalty for control inputs larger than 3
+
+    # Add a penalty for control inputs larger than 10
     control_penalty = torch.relu(u.abs() - 10).sum(dim=1).mean()
-    # loss += 1. * control_penalty
 
     if verbose:
         print(torch.symeig(Contraction)[0].min(dim=1)[0].mean(), torch.symeig(Contraction)[0].max(dim=1)[0].mean(), torch.symeig(Contraction)[0].mean())
