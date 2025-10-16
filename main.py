@@ -15,8 +15,8 @@ sys.path.append('models')
 
 # Hyperparameters
 bs = 256  # Batch size
-num_train = 256*32  # Number of samples for training
-num_test = 256*8  # Number of samples for testing
+num_train = bs*32  # Number of samples for training
+num_test = bs*8  # Number of samples for testing
 learning_rate = 0.001  # Base learning rate
 epochs = 30  # Number of training epochs
 lr_step = 10  # Learning rate step
@@ -25,8 +25,9 @@ w_ub = 10  # Upper bound of the eigenvalue of the dual metric
 w_lb = 0.1  # Lower bound of the eigenvalue of the dual metric
 
 # Configuration variables
-task = 'MUAV_point_mass'  # Name of the model
-log = 'log_MUAV_point_mass_mlp'  # Path to a directory for storing the training log
+task = 'MUAV'
+structure = 'CNN'
+log = 'log_MUAV_' + structure
 use_cuda = True  # Set to False to disable CUDA
 
 np.random.seed(1024)
@@ -56,7 +57,7 @@ num_dim_control = system.num_dim_control
 if hasattr(system, 'Bbot_func'):
     Bbot_func = system.Bbot_func
 
-model = importlib.import_module('model_'+task+'_mlp')
+model = importlib.import_module('model_'+structure)
 get_model = model.get_model
 
 model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func = get_model(num_dim_x, num_dim_control, w_lb=w_lb, use_cuda=use_cuda)
