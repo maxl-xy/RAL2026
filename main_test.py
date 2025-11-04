@@ -26,7 +26,7 @@ w_lb = 0.1  # Lower bound of the eigenvalue of the dual metric
 
 # Configuration variables
 task = 'QUADROTOR_9D'
-structure = 'CNN'
+structure = 'GNN'
 log = 'log_QUADROTOR_9D_' + structure
 use_cuda = True  # Set to False to disable CUDA
 

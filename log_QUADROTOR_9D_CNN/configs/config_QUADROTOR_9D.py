@@ -1,7 +1,7 @@
 import numpy as np
 from utils import temp_seed
 
-g = 9.81;
+g = 9.81
 
 # for ours training
 x8_lim = np.pi/3
