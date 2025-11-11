@@ -25,6 +25,7 @@ Below is a list of configuration variables and hyperparameters that can be tuned
 | num_test | Number of testing samples |
 | learning_rate| Base learning rate |
 | epochs | Number of training epochs |
+| structure | Choice of deep learning structure |
 | lr_step | Number of epochs for each learning rate |
 | _lambda | Convergence rate |
 | w_ub | Upper bound for dual metric |
@@ -40,10 +41,14 @@ Run the following command to learn a controller for the 3-drone slung payload sy
 ```
 python3 main.py
 ```
-The neural network model satisfying the contracting conditions with the best accuracy will be saved in [[log_name]/model_best.pth.tar](log_MUAV_point_mass_constrained/model_best.pth.tar) and the corresponding learned feedback controller function will be saved in [[log_name]/controller_best.pth.tar](log_MUAV_point_mass_constrained/controller_best.pth.tar). 
+Run the following command to test the 9D Quadrotor system.
+```
+python3 main_test.py
+```
+The neural network model satisfying the contracting conditions with the best accuracy will be saved in [[log_name]/model_best.pth.tar](log_MUAV_point_mass_constrained/model_best.pth.tar), and the corresponding learned feedback controller function will be saved in [[log_name]/controller_best.pth.tar](log_MUAV_point_mass_constrained/controller_best.pth.tar). 
 
 ## Simulation of closed-loop system
-The script ```plot.py``` can be used for simulating the closed-loop system under the learned controller. 
+The script ```plot.py``` can be used to simulate the closed-loop system with the learned controller. 
 
 Below is a list of variables to create the desired plot in plot.py:
 
@@ -70,17 +75,17 @@ Run the following command to evaluate the learned controller and plot the result
 python3 plot.py
 ```
 
-This runs a closed-loop simulation with the learned feedback controller stored in the training log using an RK4 solver. The UDE can be turned on/off to compare the performance of the controller. Plots are saved in [results/plots](results/plots) and CSV files are saved in [results/csvs](results/csvs) by default. Three CSV files will be produced per simulated trajectory, namely con_[i].csv, sim_[i].csv and ude[i].csv, [i] being the i<sup>th</sup> trajectory. 
+This runs a closed-loop simulation with the learned feedback controller stored in the training log using an RK4 solver. The UDE can be turned on/off to compare the controller's performance. Plots are saved in [results/plots](results/plots), and CSV files are saved in [results/csvs](results/csvs) by default. Three CSV files will be produced per simulated trajectory, namely con_[i].csv, sim_[i].csv, and ude[i].csv, [i] being the i<sup>th</sup> trajectory. 
 
 ## Matlab visualisation and plots
 To visualize the trajectories and create plots used in our paper, the [Matlab Flight Simulation Animation Package](https://github.com/LonghaoQian/AnimationModels/tree/main) developed by Dr Longhao Qian is utilised. 
 
 Open examples/quadrotor_slung_payload_model/quadrotorPayload.m and run ```quadrotorPayload.m``` in MATLAB. A 3D plot with drone figures will be shown in Figure 1. The UDE performance plot will be shown in Figure 2.
 
-To get plots for circular or figure-8 trajectories in our supplementary documents, change the struct variable name to multiquadPayloadData_cir or multiquadPayloadData_ate respectively in the four lines shown in the figure below:  
+To get plots for circular or figure-8 trajectories in our supplementary documents, change the struct variable name to multiquadPayloadData_cir or multiquadPayloadData_ate, respectively, in the four lines shown in the figure below:  
 <img src="AnimationModels-main/figures/quad_struct.png" alt="Use specified struct variable" width="530"/>
 
-To visualize simulation of your own, the CSV files generated in [results/csvs](results/csvs) need to be stored in [AnimationModels-main/examples/quadrotor_slung_payload_model](AnimationModels-main/examples/quadrotor_slung_payload_model). 
+To visualize the simulation of your own, the CSV files generated in [results/csvs](results/csvs) need to be stored in [AnimationModels-main/examples/quadrotor_slung_payload_model](AnimationModels-main/examples/quadrotor_slung_payload_model). 
 
 Then, save the CSV files of one trajectory as .mat files by running ```save_files.m```. 
 Change the struct variable name and the name of .mat files in the save_files.m according to the figure below:
