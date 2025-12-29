@@ -14,7 +14,7 @@ sys.path.append('configs')
 sys.path.append('models')
 
 # Hyperparameters
-bs = 32  # Batch size
+bs = 128  # Batch size
 num_train = bs*32  # Number of samples for training
 num_test = bs*8  # Number of samples for testing
 learning_rate = 0.001  # Base learning rate

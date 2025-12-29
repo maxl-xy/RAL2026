@@ -37,7 +37,7 @@ parser = argparse.ArgumentParser(description="")
 parser.add_argument('--task', type=str,
                         default='MUAV')
 parser.add_argument('--pretrained', type=str)
-parser.add_argument('--plot_type', type=str, default='time')
+parser.add_argument('--plot_type', type=str, default='control')
 parser.add_argument('--plot_dims', nargs='+', type=int, default=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23])
 parser.add_argument('--nTraj', type=int, default=10)
 parser.add_argument('--seed', type=int, default=1024)
@@ -77,7 +77,7 @@ if __name__ == '__main__':
 
     fig = plt.figure(figsize=(8.0, 5.0))
     if args.plot_type=='3D':
-        ax = fig.gca(projection='3d')
+        ax = fig.add_subplot(111, projection='3d')
     else:
         ax = fig.gca()
 
@@ -112,6 +112,10 @@ if __name__ == '__main__':
         elif args.plot_type=='error':
             label = 'Tracking Error' if n_traj == 0 else None
             plt.plot(t, [np.sqrt(((x-xs)**2).sum()) for x, xs in zip(x_closed[n_traj][:-1], xstar)], 'g', label=label)
+        elif args.plot_type=='control':
+            for i in range(len(controls[n_traj][0])):  # for each control dimension
+                label = f'u[{i}]' if n_traj == 0 else None
+                plt.plot(t, [u[i,0] for u in controls[n_traj]], label=label)
 
     if args.plot_type=='2D':
         plt.plot([x[args.plot_dims[0],0] for x in xstar], [x[args.plot_dims[1],0] for x in xstar], 'k', label='Reference')
@@ -137,6 +141,12 @@ if __name__ == '__main__':
         plt.xlabel("t")
         plt.ylabel("error")
         plt.title(f'{args.task} - Tracking Error')
+    elif args.plot_type=='control':
+        for i in range(num_dim_control):
+            plt.plot(t, [u[i,0] for u in ustar], 'k')
+        plt.xlabel("t")
+        plt.ylabel("u")
+        plt.title(f'{args.task} - Control Inputs')
 
     plt.subplots_adjust(left=left, bottom=bottom, right=right, top=top)
     plt.legend(frameon=True)

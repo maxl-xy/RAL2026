@@ -84,7 +84,7 @@ X_INIT_MAX = X_REF.flatten()
 XE_INIT_MIN = 0.5*XE_MIN.flatten()
 XE_INIT_MAX = 0.5*XE_MAX.flatten()
 
-time_bound = 36.
+time_bound = 126.
 time_step = 0.03
 t = np.arange(0, time_bound, time_step)
 

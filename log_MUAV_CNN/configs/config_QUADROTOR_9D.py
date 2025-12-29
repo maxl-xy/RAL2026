@@ -1,7 +1,7 @@
 import numpy as np
 from utils import temp_seed
 
-g = 9.81;
+g = 9.81
 
 # for ours training
 x8_lim = np.pi/3
@@ -31,7 +31,7 @@ XE_INIT_MIN = np.array([-0.5,]*9)
 XE_INIT_MAX = np.array([ 0.5,]*9)
 
 time_bound = 6.
-time_step = 0.03
+time_step = 0.01
 t = np.arange(0, time_bound, time_step)
 
 state_weights = np.array([1,1,1,0.1,0.1,0.1,0.1,0.1,0.1])

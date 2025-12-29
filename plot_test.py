@@ -20,20 +20,20 @@ HUGE_SIZE = 25
 
 # Simulation variables
 trajectory_type = 'circular'  # 'hover', 'circular', 'figure-8'
-plot_type = 'time'  # '2D', '3D', 'time', 'error', 'control'
-plot_dims = [0, 1, 2, 3, 4, 5, 6, 7, 8]  # For '2D', '3D', 'time' and 'error' plot types, specify which state dimensions to plot
-nTraj = 3  # Number of trajectories to simulate and plot
+plot_type = 'control'  # '2D', '3D', 'time', 'error', 'control'
+plot_dims = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]  # For '2D', '3D', 'time' and 'error' plot types, specify which state dimensions to plot
+nTraj = 5  # Number of trajectories to simulate and plot
 disturbance_switch = True  # Add constant disturbance together with Gaussian forces to the payload and quadrotors
 sigma = 0.  # Standard deviation of Gaussian noise added; 0.3 is set for figure 8 in our paper
 UDE_switch = True  # Enable UDE
 attitude_tracking_switch = True  # Enable attitude tracking controller and dynamics of quadrotors
-seed = 0  # Random seed for reproducibility
+seed = 111  # Random seed for reproducibility
 
 # Configuration variables
-task = 'QUADROTOR_9D'
-pretrained = 'log_QUADROTOR_9D_'+'MLP'  # You'll need to set this to the path of your pretrained model
-save_plot_path = os.path.join('results/plots', trajectory_type)  # Path to save the plot image, e.g., 'results/plots/3D_path.png'; to show the plot instead, set to None
-save_csv_path = os.path.join('results/csvs', trajectory_type)  # Path to save the csv files; disable with None
+task = 'MUAV'
+pretrained = 'log_MUAV_'+'CNN'  # You'll need to set this to the path of your pretrained model
+save_plot_path = os.path.join('results/plots_MUAV_CNN', trajectory_type)  # Path to save the plot image, e.g., 'results/plots/3D_path.png'; to show the plot instead, set to None
+save_csv_path = os.path.join('results/csvs_MUAV_CNN', trajectory_type)  # Path to save the csv files; disable with None
 #save_plot_path = None
 #save_csv_path = None
 
