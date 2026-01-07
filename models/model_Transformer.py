@@ -1,201 +1,196 @@
 import torch
 from torch import nn
-from torch.autograd import grad
-import numpy as np
 import math
 
+# Correct effective subspace: 3 to 18 → 15 dimensions
 effective_dim_start = 3
-effective_dim_end = 9
+effective_dim_end = 18
 
 class U_FUNC(nn.Module):
-    """Control function using Transformer-based neural networks."""
-
+    """Low-rank control correction: u = w2 @ tanh(w1 @ xe) + uref"""
+    
     def __init__(self, model_u_w1, model_u_w2, num_dim_x, num_dim_control):
-        super(U_FUNC, self).__init__()
+        super().__init__()
         self.model_u_w1 = model_u_w1
         self.model_u_w2 = model_u_w2
         self.num_dim_x = num_dim_x
         self.num_dim_control = num_dim_control
 
     def forward(self, x, xe, uref):
-        # x: B x n x 1
-        # u: B x m x 1
         bs = x.shape[0]
+        
+        # Condition on effective subspace [3:18] + error
+        cond = torch.cat([
+            x[:, effective_dim_start:effective_dim_end, :],
+            (x - xe)[:, effective_dim_start:effective_dim_end, :]
+        ], dim=1).squeeze(-1)  # B x 30 (15 + 15)
 
-        w1 = self.model_u_w1(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, -1, self.num_dim_x)
-        w2 = self.model_u_w2(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, self.num_dim_control, -1)
+        w1 = self.model_u_w1(cond).reshape(bs, -1, self.num_dim_x)
+        w2 = self.model_u_w2(cond).reshape(bs, self.num_dim_control, -1)
+
         u = w2.matmul(torch.tanh(w1.matmul(xe))) + uref
-
         return u
 
-class PositionalEncoding(nn.Module):
-    """Positional encoding for transformer input."""
-    
-    def __init__(self, d_model, max_len=50):
-        super(PositionalEncoding, self).__init__()
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        return x + self.pe[:x.size(0), :]
 
-class TransformerFeatureExtractor(nn.Module):
-    """Transformer-based feature extractor for complex pattern recognition."""
+class SetTransformerExtractor(nn.Module):
+    """
+    Permutation-invariant Set Transformer for static state vectors.
+    Treats each dimension in the input as a separate token → fully invariant to ordering.
+    Uses a learnable class token that attends to all input tokens for global pooling.
+    """
     
-    def __init__(self, input_size, output_size, d_model=128, nhead=8, num_layers=4, dim_feedforward=512):
-        super(TransformerFeatureExtractor, self).__init__()
-        self.input_size = input_size
+    def __init__(
+        self,
+        input_size,           # e.g., 15 for W, 12 for Wbot, 30 for u networks
+        output_size,
+        d_model=128,
+        nhead=8,
+        num_layers=4,
+        dim_feedforward=512,
+        dropout=0.1,
+        num_cls_tokens=1
+    ):
+        super().__init__()
         self.d_model = d_model
+        self.input_size = input_size
+        self.num_cls_tokens = num_cls_tokens
         
-        # Input projection
-        self.input_projection = nn.Linear(input_size, d_model)
+        # Project each scalar input dimension to d_model
+        self.input_projection = nn.Linear(1, d_model)
         
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model)
+        # Learnable class/query token(s)
+        self.cls_token = nn.Parameter(torch.randn(1, num_cls_tokens, d_model))
         
-        # Transformer encoder layers
+        # Learnable positional embeddings for input tokens (helps if subtle order matters)
+        self.pos_emb = nn.Parameter(torch.randn(1, input_size, d_model) * 0.02)
+        
+        # Transformer encoder with pre-norm for stability
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=0.1,
+            dropout=dropout,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Class token for global representation
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        
-        # Output projection with layer normalization
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.output_projection = nn.Sequential(
+        # Final head
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim_feedforward, output_size)
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, output_size)
         )
-    
+
     def forward(self, x):
+        """
+        x: bs x input_size
+        """
         bs = x.shape[0]
+        device = x.device
         
-        # Create sequence by applying different mathematical transformations
-        seq_len = 12  # Create a sequence of length 12
-        x_proj = self.input_projection(x)  # bs x d_model
+        # Treat each dimension as a token: bs x input_size x 1
+        x_tokens = x.unsqueeze(-1)  # bs x L x 1
+        x_tokens = self.input_projection(x_tokens)  # bs x L x d_model
         
-        # Create meaningful sequence variations using mathematical transforms
-        sequence = []
+        # Add positional embeddings
+        x_tokens = x_tokens + self.pos_emb.expand(bs, -1, -1)
         
-        # Add class token
-        cls_tokens = self.cls_token.expand(bs, -1, -1)  # bs x 1 x d_model
-        sequence.append(cls_tokens.squeeze(1))
+        # Prepend class token(s)
+        cls_tokens = self.cls_token.expand(bs, -1, -1)  # bs x num_cls x d_model
+        seq = torch.cat([cls_tokens, x_tokens], dim=1)  # bs x (num_cls + L) x d_model
         
-        for i in range(seq_len - 1):  # -1 because we added cls token
-            # Different mathematical transformations
-            if i % 4 == 0:
-                # Original projection
-                x_var = x_proj
-            elif i % 4 == 1:
-                # Rotate features
-                x_var = torch.roll(x_proj, shifts=self.d_model//4, dims=-1)
-            elif i % 4 == 2:
-                # Scale with sinusoidal pattern
-                scale = torch.sin(torch.tensor(i * np.pi / seq_len, dtype=x.dtype, device=x.device))
-                x_var = x_proj * (1 + 0.2 * scale)
-            else:
-                # Permute and mix features
-                perm = torch.randperm(self.d_model, device=x.device)[:self.d_model//2]
-                x_var = x_proj.clone()
-                x_var[:, perm] = x_var[:, perm] * 0.8 + x_var[:, torch.roll(perm, 1)] * 0.2
-            
-            sequence.append(x_var)
+        # Full self-attention
+        seq = self.transformer(seq)
         
-        x_seq = torch.stack(sequence, dim=1)  # bs x seq_len x d_model
+        # Use class token(s) as pooled representation
+        pooled = seq[:, :self.num_cls_tokens].mean(dim=1)  # bs x d_model
         
-        # Add positional encoding
-        x_seq = x_seq.transpose(0, 1)  # seq_len x bs x d_model
-        x_seq = self.pos_encoder(x_seq)
-        x_seq = x_seq.transpose(0, 1)  # bs x seq_len x d_model
-        
-        # Apply transformer
-        transformer_out = self.transformer_encoder(x_seq)  # bs x seq_len x d_model
-        
-        # Use class token representation (first token)
-        cls_output = transformer_out[:, 0, :]  # bs x d_model
-        
-        # Apply layer normalization and output projection
-        cls_output = self.layer_norm(cls_output)
-        output = self.output_projection(cls_output)
+        # Final projection
+        pooled = self.norm(pooled)
+        output = self.head(pooled)
         
         return output
 
-def get_model(num_dim_x, num_dim_control, w_lb, use_cuda = False):
-    # Transformer-based models for W computation
-    model_Wbot = TransformerFeatureExtractor(
-        effective_dim_end-effective_dim_start-num_dim_control, 
-        (num_dim_x-num_dim_control) ** 2,
-        d_model=64,
-        nhead=4,
+
+def get_model(num_dim_x=24, num_dim_control=3, w_lb=1e-4, use_cuda=True):
+    """
+    Returns the Set Transformer-based model with correct 15D effective subspace (3:18).
+    """
+    dim = effective_dim_end - effective_dim_start  # 15
+    
+    device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+    
+    # Full W matrix (input: 15 dims)
+    model_W = SetTransformerExtractor(
+        input_size=dim,
+        output_size=num_dim_x * num_dim_x,
+        d_model=128,
+        nhead=8,
+        num_layers=4,
+        dim_feedforward=512,
+        dropout=0.1
+    ).to(device)
+    
+    # Bottom block (input: 15 - 3 = 12 dims)
+    model_Wbot = SetTransformerExtractor(
+        input_size=dim - num_dim_control,
+        output_size=(num_dim_x - num_dim_control) ** 2,
+        d_model=96,
+        nhead=6,
         num_layers=3,
-        dim_feedforward=256
-    )
-
-    dim = effective_dim_end - effective_dim_start
-    model_W = TransformerFeatureExtractor(
-        dim, 
-        num_dim_x * num_dim_x,
-        d_model=128,
-        nhead=8,
-        num_layers=4,
-        dim_feedforward=512
-    )
-
-    # Transformer-based models for control computation
+        dim_feedforward=384,
+        dropout=0.1
+    ).to(device)
+    
+    # Control networks (input: state + error → 30 dims)
     c = 3 * num_dim_x
-    model_u_w1 = TransformerFeatureExtractor(
-        2*dim, 
-        c*num_dim_x,
-        d_model=128,
+    model_u_w1 = SetTransformerExtractor(
+        input_size=2 * dim,
+        output_size=c * num_dim_x,
+        d_model=160,
         nhead=8,
-        num_layers=4,
-        dim_feedforward=512
-    )
-    model_u_w2 = TransformerFeatureExtractor(
-        2*dim, 
-        num_dim_control*c,
-        d_model=128,
+        num_layers=5,
+        dim_feedforward=640,
+        dropout=0.1
+    ).to(device)
+    
+    model_u_w2 = SetTransformerExtractor(
+        input_size=2 * dim,
+        output_size=num_dim_control * c,
+        d_model=160,
         nhead=8,
-        num_layers=4,
-        dim_feedforward=512
-    )
-
-    if use_cuda:
-        model_W = model_W.cuda()
-        model_Wbot = model_Wbot.cuda()
-        model_u_w1 = model_u_w1.cuda()
-        model_u_w2 = model_u_w2.cuda()
+        num_layers=5,
+        dim_feedforward=640,
+        dropout=0.1
+    ).to(device)
 
     def W_func(x):
         bs = x.shape[0]
         x = x.squeeze(-1)
 
-        W = model_W(x[:, effective_dim_start:effective_dim_end]).view(bs, num_dim_x, num_dim_x)
-        Wbot = model_Wbot(x[:, effective_dim_start:effective_dim_end-num_dim_control]).view(bs, num_dim_x-num_dim_control, num_dim_x-num_dim_control)
-        W[:, 0:num_dim_x-num_dim_control, 0:num_dim_x-num_dim_control] = Wbot
-        W[:, num_dim_x-num_dim_control::, 0:num_dim_x-num_dim_control] = 0
-
-        W = W.transpose(1,2).matmul(W)
-        W = W + w_lb * torch.eye(num_dim_x).view(1, num_dim_x, num_dim_x).type(x.type())
+        W_full = model_W(x[:, effective_dim_start:effective_dim_end]) \
+                 .view(bs, num_dim_x, num_dim_x)
+        
+        W_bot = model_Wbot(x[:, effective_dim_start:effective_dim_end - num_dim_control]) \
+                .view(bs, num_dim_x - num_dim_control, num_dim_x - num_dim_control)
+        
+        W = W_full.clone()
+        W[:, :num_dim_x - num_dim_control, :num_dim_x - num_dim_control] = W_bot
+        W[:, num_dim_x - num_dim_control:, :num_dim_x - num_dim_control] = 0.0
+        
+        # Ensure positive definite
+        W = W.transpose(1, 2) @ W
+        W = W + w_lb * torch.eye(num_dim_x, device=device).unsqueeze(0)
+        
         return W
 
-    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control)
+    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control).to(device)
 
     return model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func

@@ -1,154 +1,191 @@
 import torch
 from torch import nn
-from torch.autograd import grad
-import numpy as np
 
 effective_dim_start = 3
-effective_dim_end = 9
+effective_dim_end = 18
+
 
 class U_FUNC(nn.Module):
-    """Control function using LSTM-based neural networks."""
-
+    """Low-rank control correction: u = w2 @ tanh(w1 @ xe) + uref"""
+    
     def __init__(self, model_u_w1, model_u_w2, num_dim_x, num_dim_control):
-        super(U_FUNC, self).__init__()
+        super().__init__()
         self.model_u_w1 = model_u_w1
         self.model_u_w2 = model_u_w2
         self.num_dim_x = num_dim_x
         self.num_dim_control = num_dim_control
 
     def forward(self, x, xe, uref):
-        # x: B x n x 1
-        # u: B x m x 1
         bs = x.shape[0]
+        
+        # Condition on effective subspace [3:18] + error → 30 dims
+        cond = torch.cat([
+            x[:, effective_dim_start:effective_dim_end, :],
+            (x - xe)[:, effective_dim_start:effective_dim_end, :]
+        ], dim=1).squeeze(-1)  # B x 30
 
-        w1 = self.model_u_w1(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, -1, self.num_dim_x)
-        w2 = self.model_u_w2(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, self.num_dim_control, -1)
+        w1 = self.model_u_w1(cond).reshape(bs, -1, self.num_dim_x)
+        w2 = self.model_u_w2(cond).reshape(bs, self.num_dim_control, -1)
+
         u = w2.matmul(torch.tanh(w1.matmul(xe))) + uref
-
         return u
 
-class LSTMFeatureExtractor(nn.Module):
-    """LSTM-based feature extractor for sequential data processing."""
+
+class LSTMExtractor(nn.Module):
+    """
+    LSTM feature extractor with chunking.
+    Splits the input vector into fixed-size chunks to form a short sequence.
+    Example: 15D → 5 chunks of 3 dims; 30D → 10 chunks of 3 dims.
+    """
     
-    def __init__(self, input_size, output_size, hidden_size=128, num_layers=2):
-        super(LSTMFeatureExtractor, self).__init__()
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        chunk_size=3,
+        hidden_size=128,
+        num_layers=3,
+        dropout=0.1,
+        bidirectional=True
+    ):
+        super().__init__()
+        assert input_size % chunk_size == 0, f"input_size ({input_size}) must be divisible by chunk_size ({chunk_size})"
+        
         self.input_size = input_size
+        self.chunk_size = chunk_size
+        self.seq_len = input_size // chunk_size
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.dir_factor = 2 if bidirectional else 1
         
-        # Input projection to create sequence dimension
-        self.input_projection = nn.Linear(input_size, hidden_size)
+        # Project each chunk
+        self.chunk_proj = nn.Linear(chunk_size, hidden_size)
         
-        # LSTM layers
+        # LSTM
         self.lstm = nn.LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=0.1 if num_layers > 1 else 0,
-            bidirectional=True
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional
         )
         
-        # Attention mechanism for sequence aggregation
+        # Layer norm and dropout
+        self.norm = nn.LayerNorm(hidden_size * self.dir_factor)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Learnable attention for weighted aggregation
         self.attention = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),  # *2 for bidirectional
+            nn.Linear(hidden_size * self.dir_factor, hidden_size),
             nn.Tanh(),
             nn.Linear(hidden_size, 1)
         )
         
-        # Final output projection
-        self.output_projection = nn.Sequential(
-            nn.Linear(hidden_size * 2, 128),
-            nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(128, output_size)
+        # Final head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * self.dir_factor, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(hidden_size // 2, output_size)
         )
-    
+
     def forward(self, x):
+        """
+        x: bs x input_size
+        """
         bs = x.shape[0]
         
-        # Create artificial sequence by expanding and varying the input
-        # This creates multiple "time steps" from the single input vector
-        seq_len = 8  # Create a sequence of length 8
-        x_proj = self.input_projection(x)  # bs x hidden_size
+        # Reshape into chunks: bs x seq_len x chunk_size
+        x_chunked = x.view(bs, self.seq_len, self.chunk_size)
         
-        # Create sequence by applying different transformations
-        sequence = []
-        for i in range(seq_len):
-            # Add positional encoding-like variations
-            pos_encoding = torch.sin(torch.tensor(i * np.pi / seq_len, dtype=x.dtype, device=x.device))
-            x_var = x_proj * (1 + 0.1 * pos_encoding)
-            sequence.append(x_var)
+        # Project chunks
+        x_seq = self.chunk_proj(x_chunked)  # bs x seq_len x hidden_size
         
-        x_seq = torch.stack(sequence, dim=1)  # bs x seq_len x hidden_size
+        # LSTM
+        lstm_out, (h_n, c_n) = self.lstm(x_seq)  # bs x seq_len x (hidden * dir)
         
-        # Apply LSTM with CuDNN disabled to support double backwards
-        with torch.backends.cudnn.flags(enabled=False):
-            lstm_out, (h_n, c_n) = self.lstm(x_seq)  # bs x seq_len x (hidden_size*2)
+        # Attention weights
+        attn_weights = self.attention(lstm_out)  # bs x seq_len x 1
+        attn_weights = torch.softmax(attn_weights, dim=1)
         
-        # Apply attention to aggregate sequence
-        attention_weights = self.attention(lstm_out)  # bs x seq_len x 1
-        attention_weights = torch.softmax(attention_weights, dim=1)
+        # Weighted aggregation
+        context = torch.sum(lstm_out * attn_weights, dim=1)  # bs x (hidden * dir)
         
-        # Weighted sum of LSTM outputs
-        aggregated = torch.sum(lstm_out * attention_weights, dim=1)  # bs x (hidden_size*2)
+        # Normalize and dropout
+        context = self.norm(context)
+        context = self.dropout(context)
         
-        # Final projection
-        output = self.output_projection(aggregated)
+        # Final output
+        output = self.head(context)
         
         return output
 
-def get_model(num_dim_x, num_dim_control, w_lb, use_cuda = False):
-    # LSTM-based models for W computation
-    model_Wbot = LSTMFeatureExtractor(
-        effective_dim_end-effective_dim_start-num_dim_control, 
-        (num_dim_x-num_dim_control) ** 2,
-        hidden_size=64,
-        num_layers=2
-    )
 
-    dim = effective_dim_end - effective_dim_start
-    model_W = LSTMFeatureExtractor(
-        dim, 
-        num_dim_x * num_dim_x,
+def get_model(num_dim_x=24, num_dim_control=3, w_lb=1e-4, use_cuda=True):
+    dim = effective_dim_end - effective_dim_start  # 15
+    chunk_size = 3  # Perfectly divides 15→5, 12→4, 30→10
+    
+    device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+    
+    model_W = LSTMExtractor(
+        input_size=dim,
+        output_size=num_dim_x * num_dim_x,
+        chunk_size=chunk_size,
         hidden_size=128,
-        num_layers=2
-    )
-
-    # LSTM-based models for control computation
+        num_layers=3,
+        dropout=0.1
+    ).to(device)
+    
+    model_Wbot = LSTMExtractor(
+        input_size=dim - num_dim_control,  # 12
+        output_size=(num_dim_x - num_dim_control) ** 2,
+        chunk_size=chunk_size,
+        hidden_size=96,
+        num_layers=3,
+        dropout=0.1
+    ).to(device)
+    
     c = 3 * num_dim_x
-    model_u_w1 = LSTMFeatureExtractor(
-        2*dim, 
-        c*num_dim_x,
-        hidden_size=128,
-        num_layers=2
-    )
-    model_u_w2 = LSTMFeatureExtractor(
-        2*dim, 
-        num_dim_control*c,
-        hidden_size=128,
-        num_layers=2
-    )
-
-    if use_cuda:
-        model_W = model_W.cuda()
-        model_Wbot = model_Wbot.cuda()
-        model_u_w1 = model_u_w1.cuda()
-        model_u_w2 = model_u_w2.cuda()
+    model_u_w1 = LSTMExtractor(
+        input_size=2 * dim,  # 30
+        output_size=c * num_dim_x,
+        chunk_size=chunk_size,
+        hidden_size=160,
+        num_layers=4,
+        dropout=0.1
+    ).to(device)
+    
+    model_u_w2 = LSTMExtractor(
+        input_size=2 * dim,
+        output_size=num_dim_control * c,
+        chunk_size=chunk_size,
+        hidden_size=160,
+        num_layers=4,
+        dropout=0.1
+    ).to(device)
 
     def W_func(x):
         bs = x.shape[0]
         x = x.squeeze(-1)
 
-        W = model_W(x[:, effective_dim_start:effective_dim_end]).view(bs, num_dim_x, num_dim_x)
-        Wbot = model_Wbot(x[:, effective_dim_start:effective_dim_end-num_dim_control]).view(bs, num_dim_x-num_dim_control, num_dim_x-num_dim_control)
-        W[:, 0:num_dim_x-num_dim_control, 0:num_dim_x-num_dim_control] = Wbot
-        W[:, num_dim_x-num_dim_control::, 0:num_dim_x-num_dim_control] = 0
-
-        W = W.transpose(1,2).matmul(W)
-        W = W + w_lb * torch.eye(num_dim_x).view(1, num_dim_x, num_dim_x).type(x.type())
+        W_full = model_W(x[:, effective_dim_start:effective_dim_end]) \
+                 .view(bs, num_dim_x, num_dim_x)
+        
+        W_bot = model_Wbot(x[:, effective_dim_start:effective_dim_end - num_dim_control]) \
+                .view(bs, num_dim_x - num_dim_control, num_dim_x - num_dim_control)
+        
+        W = W_full.clone()
+        W[:, :num_dim_x - num_dim_control, :num_dim_x - num_dim_control] = W_bot
+        W[:, num_dim_x - num_dim_control:, :num_dim_x - num_dim_control] = 0.0
+        
+        W = W.transpose(1, 2) @ W
+        W = W + w_lb * torch.eye(num_dim_x, device=device).unsqueeze(0)
+        
         return W
 
-    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control)
+    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control).to(device)
 
     return model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func

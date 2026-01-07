@@ -1,163 +1,191 @@
 import torch
 from torch import nn
-from torch.autograd import grad
-import numpy as np
 
 effective_dim_start = 3
-effective_dim_end = 9
+effective_dim_end = 18
+
 
 class U_FUNC(nn.Module):
-    """Control function using GRU-based neural networks."""
-
+    """Low-rank control correction: u = w2 @ tanh(w1 @ xe) + uref"""
+    
     def __init__(self, model_u_w1, model_u_w2, num_dim_x, num_dim_control):
-        super(U_FUNC, self).__init__()
+        super().__init__()
         self.model_u_w1 = model_u_w1
         self.model_u_w2 = model_u_w2
         self.num_dim_x = num_dim_x
         self.num_dim_control = num_dim_control
 
     def forward(self, x, xe, uref):
-        # x: B x n x 1
-        # u: B x m x 1
         bs = x.shape[0]
+        
+        # Condition on effective subspace [3:18] + error → 30 dims
+        cond = torch.cat([
+            x[:, effective_dim_start:effective_dim_end, :],
+            (x - xe)[:, effective_dim_start:effective_dim_end, :]
+        ], dim=1).squeeze(-1)  # B x 30
 
-        w1 = self.model_u_w1(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, -1, self.num_dim_x)
-        w2 = self.model_u_w2(torch.cat([x[:,effective_dim_start:effective_dim_end,:],(x-xe)[:,effective_dim_start:effective_dim_end,:]],dim=1).squeeze(-1)).reshape(bs, self.num_dim_control, -1)
+        w1 = self.model_u_w1(cond).reshape(bs, -1, self.num_dim_x)
+        w2 = self.model_u_w2(cond).reshape(bs, self.num_dim_control, -1)
+
         u = w2.matmul(torch.tanh(w1.matmul(xe))) + uref
-
         return u
 
-class GRUFeatureExtractor(nn.Module):
-    """GRU-based feature extractor for sequential data processing."""
+
+class GRUExtractor(nn.Module):
+    """
+    GRU feature extractor with chunking.
+    Splits the input vector into fixed-size chunks to form a short sequence.
+    Example: 15D → 5 chunks of 3 dims; 30D → 10 chunks of 3 dims.
+    """
     
-    def __init__(self, input_size, output_size, hidden_size=128, num_layers=2):
-        super(GRUFeatureExtractor, self).__init__()
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        chunk_size=3,
+        hidden_size=128,
+        num_layers=3,
+        dropout=0.1,
+        bidirectional=True
+    ):
+        super().__init__()
+        assert input_size % chunk_size == 0, f"input_size ({input_size}) must be divisible by chunk_size ({chunk_size})"
+        
         self.input_size = input_size
+        self.chunk_size = chunk_size
+        self.seq_len = input_size // chunk_size
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.dir_factor = 2 if bidirectional else 1
         
-        # Input projection to create sequence dimension
-        self.input_projection = nn.Linear(input_size, hidden_size)
+        # Project each chunk
+        self.chunk_proj = nn.Linear(chunk_size, hidden_size)
         
-        # GRU layers with CuDNN disabled to support double backwards
+        # GRU
         self.gru = nn.GRU(
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=0.1 if num_layers > 1 else 0,
-            bidirectional=True
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional
         )
         
-        # Store original setting
-        self.original_cudnn_enabled = torch.backends.cudnn.enabled
+        # Normalization and dropout
+        self.norm = nn.LayerNorm(hidden_size * self.dir_factor)
+        self.dropout = nn.Dropout(dropout)
         
-        # Multi-head attention for better sequence aggregation
-        self.multihead_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size * 2,  # *2 for bidirectional
+        # Self-attention over sequence
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size * self.dir_factor,
             num_heads=8,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True
         )
         
-        # Final output projection with residual connection
-        self.output_projection = nn.Sequential(
-            nn.Linear(hidden_size * 2, 128),
-            nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(128, output_size)
+        # Final head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * self.dir_factor, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(hidden_size // 2, output_size)
         )
-    
+
     def forward(self, x):
+        """
+        x: bs x input_size
+        """
         bs = x.shape[0]
         
-        # Create artificial sequence by expanding and varying the input
-        seq_len = 10  # Create a sequence of length 10
-        x_proj = self.input_projection(x)  # bs x hidden_size
+        # Reshape into chunks: bs x seq_len x chunk_size
+        x_chunked = x.view(bs, self.seq_len, self.chunk_size)
         
-        # Create sequence with different transformations and noise
-        sequence = []
-        for i in range(seq_len):
-            # Add structured variations to create meaningful sequence
-            phase = 2 * np.pi * i / seq_len
-            cos_encoding = torch.cos(torch.tensor(phase, dtype=x.dtype, device=x.device))
-            sin_encoding = torch.sin(torch.tensor(phase, dtype=x.dtype, device=x.device))
-            
-            # Apply rotation-like transformation
-            x_var = x_proj * (1 + 0.1 * cos_encoding) + 0.05 * sin_encoding * torch.roll(x_proj, shifts=1, dims=-1)
-            sequence.append(x_var)
+        # Project chunks
+        x_seq = self.chunk_proj(x_chunked)  # bs x seq_len x hidden_size
         
-        x_seq = torch.stack(sequence, dim=1)  # bs x seq_len x hidden_size
+        # GRU
+        gru_out, _ = self.gru(x_seq)  # bs x seq_len x (hidden * dir)
         
-        # Apply GRU with CuDNN disabled to support double backwards
-        with torch.backends.cudnn.flags(enabled=False):
-            gru_out, h_n = self.gru(x_seq)  # bs x seq_len x (hidden_size*2)
+        # Self-attention
+        attn_out, _ = self.attention(gru_out, gru_out, gru_out)
         
-        # Apply multi-head self-attention
-        attn_out, _ = self.multihead_attention(gru_out, gru_out, gru_out)
+        # Residual + norm
+        seq_out = self.norm(gru_out + attn_out)
+        seq_out = self.dropout(seq_out)
         
-        # Combine GRU output and attention output
-        combined = gru_out + attn_out  # Residual connection
+        # Global mean pooling
+        pooled = seq_out.mean(dim=1)  # bs x (hidden * dir)
         
-        # Global average pooling across sequence dimension
-        aggregated = torch.mean(combined, dim=1)  # bs x (hidden_size*2)
-        
-        # Final projection
-        output = self.output_projection(aggregated)
+        # Output
+        output = self.head(pooled)
         
         return output
 
-def get_model(num_dim_x, num_dim_control, w_lb, use_cuda = False):
-    # GRU-based models for W computation
-    model_Wbot = GRUFeatureExtractor(
-        effective_dim_end-effective_dim_start-num_dim_control, 
-        (num_dim_x-num_dim_control) ** 2,
-        hidden_size=64,
-        num_layers=2
-    )
 
-    dim = effective_dim_end - effective_dim_start
-    model_W = GRUFeatureExtractor(
-        dim, 
-        num_dim_x * num_dim_x,
+def get_model(num_dim_x=24, num_dim_control=3, w_lb=1e-4, use_cuda=True):
+    dim = effective_dim_end - effective_dim_start  # 15
+    chunk_size = 3  # Works perfectly: 15→5, 12→4, 30→10
+    
+    device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+    
+    model_W = GRUExtractor(
+        input_size=dim,
+        output_size=num_dim_x * num_dim_x,
+        chunk_size=chunk_size,
         hidden_size=128,
-        num_layers=2
-    )
-
-    # GRU-based models for control computation
+        num_layers=3,
+        dropout=0.1
+    ).to(device)
+    
+    model_Wbot = GRUExtractor(
+        input_size=dim - num_dim_control,  # 12
+        output_size=(num_dim_x - num_dim_control) ** 2,
+        chunk_size=chunk_size,
+        hidden_size=96,
+        num_layers=3,
+        dropout=0.1
+    ).to(device)
+    
     c = 3 * num_dim_x
-    model_u_w1 = GRUFeatureExtractor(
-        2*dim, 
-        c*num_dim_x,
-        hidden_size=128,
-        num_layers=2
-    )
-    model_u_w2 = GRUFeatureExtractor(
-        2*dim, 
-        num_dim_control*c,
-        hidden_size=128,
-        num_layers=2
-    )
-
-    if use_cuda:
-        model_W = model_W.cuda()
-        model_Wbot = model_Wbot.cuda()
-        model_u_w1 = model_u_w1.cuda()
-        model_u_w2 = model_u_w2.cuda()
+    model_u_w1 = GRUExtractor(
+        input_size=2 * dim,  # 30
+        output_size=c * num_dim_x,
+        chunk_size=chunk_size,
+        hidden_size=160,
+        num_layers=4,
+        dropout=0.1
+    ).to(device)
+    
+    model_u_w2 = GRUExtractor(
+        input_size=2 * dim,
+        output_size=num_dim_control * c,
+        chunk_size=chunk_size,
+        hidden_size=160,
+        num_layers=4,
+        dropout=0.1
+    ).to(device)
 
     def W_func(x):
         bs = x.shape[0]
         x = x.squeeze(-1)
 
-        W = model_W(x[:, effective_dim_start:effective_dim_end]).view(bs, num_dim_x, num_dim_x)
-        Wbot = model_Wbot(x[:, effective_dim_start:effective_dim_end-num_dim_control]).view(bs, num_dim_x-num_dim_control, num_dim_x-num_dim_control)
-        W[:, 0:num_dim_x-num_dim_control, 0:num_dim_x-num_dim_control] = Wbot
-        W[:, num_dim_x-num_dim_control::, 0:num_dim_x-num_dim_control] = 0
-
-        W = W.transpose(1,2).matmul(W)
-        W = W + w_lb * torch.eye(num_dim_x).view(1, num_dim_x, num_dim_x).type(x.type())
+        W_full = model_W(x[:, effective_dim_start:effective_dim_end]) \
+                 .view(bs, num_dim_x, num_dim_x)
+        
+        W_bot = model_Wbot(x[:, effective_dim_start:effective_dim_end - num_dim_control]) \
+                .view(bs, num_dim_x - num_dim_control, num_dim_x - num_dim_control)
+        
+        W = W_full.clone()
+        W[:, :num_dim_x - num_dim_control, :num_dim_x - num_dim_control] = W_bot
+        W[:, num_dim_x - num_dim_control:, :num_dim_x - num_dim_control] = 0.0
+        
+        W = W.transpose(1, 2) @ W
+        W = W + w_lb * torch.eye(num_dim_x, device=device).unsqueeze(0)
+        
         return W
 
-    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control)
+    u_func = U_FUNC(model_u_w1, model_u_w2, num_dim_x, num_dim_control).to(device)
 
     return model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func
