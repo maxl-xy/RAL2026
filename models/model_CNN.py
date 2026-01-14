@@ -4,7 +4,7 @@ from torch.autograd import grad
 import numpy as np
 
 effective_dim_start = 3
-effective_dim_end = 18
+effective_dim_end = 24
 
 class U_FUNC(nn.Module):
     """Control function using CNN-based neural networks."""
